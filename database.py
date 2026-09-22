@@ -13,13 +13,43 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    select,
+    text,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
+def _normalize_database_url(url: str) -> str:
+    """Accept the standard PostgreSQL URI and route it to psycopg 3.
+
+    Deployments hand out ``postgresql://`` -- the libpq form that psql, cloud
+    panels, Compose and Kubernetes Secrets all speak.  SQLAlchemy reads the
+    scheme as ``dialect+driver`` and maps a bare ``postgresql://`` to psycopg2,
+    which this project does not depend on.  Pin the driver here rather than
+    making every environment know which Python package happens to be vendored.
+    """
+
+    if url.startswith("postgres://"):  # legacy scheme, dropped in SQLAlchemy 1.4
+        url = "postgresql://" + url[len("postgres://") :]
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    return url
+
+
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return _normalize_database_url(
+        os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    )
 
 
 def positive_int(name: str, default: int) -> int:
@@ -31,6 +61,8 @@ def positive_int(name: str, default: int) -> int:
 
 
 DATABASE_URL = _database_url()
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
+IS_POSTGRES = DATABASE_URL.startswith("postgresql")
 LEASE_SECONDS = positive_int("RELAY_LEASE_SECONDS", 60)
 MAX_ATTEMPTS = positive_int("RELAY_MAX_ATTEMPTS", 5)
 RECOVERY_INTERVAL_SECONDS = max(1, positive_int("RELAY_RECOVERY_INTERVAL_SECONDS", 5))
@@ -135,6 +167,17 @@ def _is_sqlite(url: str) -> bool:
 
 
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
+if IS_POSTGRES:
+    # Every relay replica keeps its own pool.  SQLAlchemy's default of 5 plus 10
+    # overflow is too small once a fleet of workers long-polls /tasks/claim, and
+    # too small for the concurrent-claim test below, so make it explicit.
+    engine_kwargs.update(
+        {
+            "pool_size": positive_int("RELAY_DB_POOL_SIZE", 10),
+            "max_overflow": positive_int("RELAY_DB_MAX_OVERFLOW", 20),
+            "pool_timeout": positive_int("RELAY_DB_POOL_TIMEOUT", 30),
+        }
+    )
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
     if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
@@ -158,7 +201,23 @@ if _is_sqlite(DATABASE_URL):
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
+_SCHEMA_LOCK_KEY = 0x41475246  # arbitrary but stable 64-bit key ("AGRF")
+
+
 def init_db() -> None:
+    """Create the schema once, even when several replicas boot together.
+
+    ``create_all`` emits CREATE TABLE IF NOT EXISTS, but PostgreSQL takes
+    exclusive DDL locks: two API pods starting in the same second can deadlock
+    or raise a duplicate-table error.  A transaction-scoped advisory lock lets
+    the first replica win; the rest wait, then find the tables already there.
+    """
+
+    if IS_POSTGRES:
+        with engine.begin() as connection:
+            connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _SCHEMA_LOCK_KEY})
+            Base.metadata.create_all(connection)
+        return
     Base.metadata.create_all(engine)
 
 
@@ -177,19 +236,23 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Open the writer transaction that claims, heartbeats and recovery share.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    The two backends reach the same guarantee by opposite means.  SQLite has no
+    ``FOR UPDATE``, so ``BEGIN IMMEDIATE`` reserves the single writer slot up
+    front and serializes every mutating operation across processes.  PostgreSQL
+    runs them concurrently and relies on per-row locks instead -- see
+    :func:`lock_rows`, which each call site applies to the rows it actually
+    needs.  Swapping one global lock for several row locks is the substance of
+    the port: a plain transaction here with no locking there would let two
+    workers claim the same task.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if IS_SQLITE:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -201,21 +264,56 @@ def immediate_transaction() -> Generator[Session, None, None]:
         connection.close()
 
 
+def lock_rows(query: Any, *, skip_locked: bool = False) -> Any:
+    """Apply row locking on backends that have it.
+
+    No-op on SQLite, where ``immediate_transaction`` already serializes writers.
+    On PostgreSQL ``SKIP LOCKED`` lets a second worker step over a row another
+    transaction is already working on instead of queueing behind it, while a
+    plain ``FOR UPDATE`` makes heartbeats and terminal submissions wait for the
+    row they specifically need.
+    """
+
+    if not IS_POSTGRES:
+        return query
+    return query.with_for_update(skip_locked=skip_locked)
+
+
 def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
+    # Read candidates without locking, then take locks in the order every other
+    # operation uses: task first, then its attempt.  Locking the attempt first
+    # would invert claim_one's order and let two PostgreSQL transactions
+    # deadlock against each other.
+    candidate_ids = list(
         db.scalars(
-            select(Attempt)
+            select(Attempt.task_id)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task_id in candidate_ids:
+        # Skip rather than block: another replica's recovery pass or an
+        # in-flight claim already owns this task, and will resolve it.
+        task = db.scalar(lock_rows(select(Task).where(Task.id == task_id), skip_locked=True))
+        if task is None:
+            continue
+        attempt = db.scalar(
+            lock_rows(
+                select(Attempt)
+                .where(Attempt.task_id == task_id, Attempt.outcome == "processing")
+                .order_by(Attempt.attempt_number.desc())
+                .limit(1)
+            )
+        )
+        if attempt is None:
+            continue
+        if attempt.lease_expires_at > now_db:
+            # Re-read under the lock: a heartbeat may have renewed the lease
+            # between the unlocked scan above and acquiring the row.
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
@@ -245,6 +343,8 @@ __all__ = [
     "Base",
     "DATABASE_URL",
     "DEFAULT_PAGE_SIZE",
+    "IS_POSTGRES",
+    "IS_SQLITE",
     "LEASE_SECONDS",
     "MAX_ATTEMPTS",
     "MAX_BODY_BYTES",
@@ -258,6 +358,7 @@ __all__ = [
     "immediate_transaction",
     "init_db",
     "iso_time",
+    "lock_rows",
     "recover_expired",
     "recover_expired_in_session",
     "utcnow",

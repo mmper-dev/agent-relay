@@ -1,9 +1,11 @@
 """Persistence operations for Agent Relay.
 
 Routes and the worker call these functions instead of issuing SQL directly.
-Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+Claim, heartbeat, terminal submission, and recovery all open the same writer
+transaction, but each one declares the row locking it needs through
+``lock_rows``: SKIP LOCKED where an operation should move on to another row,
+blocking FOR UPDATE where it must have the row it asked for.  On SQLite those
+locks are no-ops and BEGIN IMMEDIATE serializes the lot.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import (
@@ -31,6 +34,7 @@ from database import (
     db_time,
     immediate_transaction,
     iso_time,
+    lock_rows,
     recover_expired,
     recover_expired_in_session,
     utcnow,
@@ -103,9 +107,36 @@ def list_agents(limit: int, cursor: tuple[datetime, str] | None) -> tuple[list[A
     return rows, encode_cursor(rows[-1].created_at, rows[-1].id) if has_more and rows else None
 
 
+def _existing_idempotent_task(sender_id: str, recipient_id: str, input_text: str, key: str) -> dict[str, str]:
+    """Return the task a duplicate Idempotency-Key already created."""
+
+    with db_session() as db:
+        existing = db.scalar(select(Task).where(Task.sender_id == sender_id, Task.idempotency_key == key))
+        if existing is None:  # the insert failed for some other reason
+            raise RelayError("invalid_input", "The task could not be created.", 400)
+        if existing.recipient_id != recipient_id or existing.input != input_text:
+            raise RelayError(
+                "idempotency_conflict",
+                "This Idempotency-Key was already used with a different task.",
+                409,
+            )
+        return {"task_id": existing.id, "status": existing.status}
+
+
 def create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
-    # Serializing task creation makes the sender-scoped idempotency check and
-    # unique constraint one operation even when two API processes race.
+    # The read-then-insert below is not atomic on PostgreSQL, where two API
+    # replicas can pass the duplicate check in parallel.  Rather than lock, let
+    # uq_task_sender_idempotency arbitrate and treat the loser's IntegrityError
+    # as proof that someone else created the very task it was asking for.
+    try:
+        return _create_task(sender_id, recipient_id, input_text, idempotency_key)
+    except IntegrityError:
+        if idempotency_key is None:
+            raise
+        return _existing_idempotent_task(sender_id, recipient_id, input_text, idempotency_key)
+
+
+def _create_task(sender_id: str, recipient_id: str, input_text: str, idempotency_key: str | None) -> dict[str, str]:
     with immediate_transaction() as db:
         recipient = db.get(Agent, recipient_id)
         if recipient is None:
@@ -144,11 +175,18 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
+        # The reason the port exists.  Two workers polling the same inbox must
+        # not both come back holding the same row: SKIP LOCKED makes the second
+        # transaction step over it and take the next queued task instead.  On
+        # SQLite this is a plain SELECT and BEGIN IMMEDIATE does the work.
         task = db.scalar(
-            select(Task)
-            .where(Task.recipient_id == agent_id, Task.status == "queued")
-            .order_by(Task.created_at, Task.id)
-            .limit(1)
+            lock_rows(
+                select(Task)
+                .where(Task.recipient_id == agent_id, Task.status == "queued")
+                .order_by(Task.created_at, Task.id)
+                .limit(1),
+                skip_locked=True,
+            )
         )
         if task is None:
             return None
@@ -188,14 +226,20 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
 
 
 def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
+    # Callers always hold the task lock first, so task -> attempt is the one
+    # lock order in this module and no pair of operations can deadlock.
     return db.scalar(
-        select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+        lock_rows(
+            select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+        )
     )
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        # Blocking FOR UPDATE, not SKIP LOCKED: this heartbeat is about one
+        # specific task and must wait for it rather than silently do nothing.
+        task = db.scalar(lock_rows(select(Task).where(Task.id == task_id)))
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)
@@ -222,7 +266,9 @@ def commit_terminal(
     value: str,
 ) -> dict[str, str]:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        # Blocking FOR UPDATE: a terminal submission races recovery for this
+        # exact row, and exactly one of them must win.
+        task = db.scalar(lock_rows(select(Task).where(Task.id == task_id)))
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)

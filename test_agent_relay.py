@@ -1,9 +1,12 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests, run against whichever backend RELAY_DATABASE_URL names.
 
-These tests intentionally exercise storage calls from multiple threads: that
-is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+These tests exercise storage calls from multiple threads: the closest local
+equivalent to several worker processes racing to claim an inbox.  The guarantee
+comes from the database -- BEGIN IMMEDIATE on SQLite, FOR UPDATE SKIP LOCKED on
+PostgreSQL -- never from a Python lock, so the same assertions must hold on
+both.  Point RELAY_DATABASE_URL at a PostgreSQL instance to run them there:
+
+    RELAY_DATABASE_URL=postgresql://relay:relay@localhost:5432/relay uv run pytest -q
 """
 
 from __future__ import annotations
@@ -22,8 +25,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
-from storage import claim_one
+from database import (
+    MAX_ATTEMPTS,
+    Attempt,
+    Base,
+    Task,
+    as_db_time,
+    db_session,
+    engine,
+    recover_expired,
+    utcnow,
+)
+from storage import claim_one, create_task, heartbeat
 
 
 @pytest.fixture(autouse=True)
@@ -98,7 +111,7 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_atomic_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")
@@ -160,3 +173,104 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def expire_lease(task_id: str) -> None:
+    """Age the active lease so the next recovery pass treats it as dead."""
+
+    with db_session() as db:
+        attempt = (
+            db.query(Attempt)
+            .filter(Attempt.task_id == task_id, Attempt.outcome == "processing")
+            .order_by(Attempt.attempt_number.desc())
+            .first()
+        )
+        assert attempt is not None
+        attempt.lease_expires_at = as_db_time(utcnow() - timedelta(seconds=1))
+
+
+def test_parallel_idempotency_key_creates_one_task():
+    """Two replicas racing on the same key must not both insert.
+
+    The duplicate check and the insert are separate statements, so on PostgreSQL
+    both callers can pass the check before either commits.  The unique
+    constraint is what actually enforces this, and the loser must be handed the
+    winner's task rather than an error.
+    """
+
+    with TestClient(main.app) as client:
+        sender, _ = register(client, "sender")
+        recipient, _ = register(client, "recipient")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda _: create_task(sender["agent_id"], recipient["agent_id"], "same input", "race-key"),
+                    range(8),
+                )
+            )
+        assert len({result["task_id"] for result in results}) == 1
+        with db_session() as db:
+            assert db.query(Task).filter(Task.sender_id == sender["agent_id"]).count() == 1
+
+
+def test_heartbeat_holds_the_lease_against_other_workers():
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "sender")
+        recipient, _ = register(client, "recipient")
+        task = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "long job"},
+        ).json()
+        claim = claim_one(recipient["agent_id"], "slow-worker")
+        assert claim is not None
+        renewed = heartbeat(task["task_id"], recipient["agent_id"], claim["claim_token"])
+        assert renewed >= claim["lease_expires_at"]
+        # A renewed lease is an active lease: nobody else may take this task,
+        # and recovery must leave it alone.
+        assert claim_one(recipient["agent_id"], "other-worker") is None
+        assert recover_expired() == 0
+
+
+def test_attempt_limit_fails_the_task_and_removes_it_from_claims():
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "sender")
+        recipient, sender_headers_recipient = register(client, "recipient")
+        task = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "nobody finishes me"},
+        ).json()
+        task_id = task["task_id"]
+        for expected_attempt in range(1, MAX_ATTEMPTS + 1):
+            claim = claim_one(recipient["agent_id"], f"worker-{expected_attempt}")
+            assert claim is not None, f"expected attempt {expected_attempt} to be claimable"
+            assert claim["attempt"] == expected_attempt
+            expire_lease(task_id)
+            recover_expired()
+        assert claim_one(recipient["agent_id"], "one-too-many") is None
+        final = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert final["status"] == "failed"
+        assert final["error"] == "attempts_exhausted"
+        assert final["attempt_count"] == MAX_ATTEMPTS
+
+
+def test_unrelated_agent_cannot_read_or_claim_another_inbox():
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "sender")
+        recipient, _ = register(client, "recipient")
+        _outsider, outsider_headers = register(client, "outsider")
+        task = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "private"},
+        ).json()
+        task_id = task["task_id"]
+        assert client.get(f"/api/v1/tasks/{task_id}", headers=outsider_headers).status_code == 404
+        assert client.get(f"/api/v1/tasks/{task_id}/attempts", headers=outsider_headers).status_code == 404
+        # The outsider's own inbox is empty, so claiming returns no work rather
+        # than leaking the recipient's queued task.
+        stolen = client.post(
+            "/api/v1/tasks/claim", headers=outsider_headers, json={"worker_id": "thief", "wait_seconds": 0}
+        )
+        assert stolen.status_code == 204

@@ -80,6 +80,49 @@ an active lease. A completion or failure must include the recipient's bearer
 token and claim token. Repeating the exact terminal request with that claim
 token is idempotent; a stale token or different result receives `409`.
 
+## Running on PostgreSQL
+
+The storage layer now supports both backends from one code path.  Point
+`RELAY_DATABASE_URL` (or `DATABASE_URL`) at PostgreSQL and nothing else changes:
+
+```bash
+docker run -d --name relay-pg -p 5432:5432 \
+  -e POSTGRES_USER=relay -e POSTGRES_PASSWORD=relay -e POSTGRES_DB=relay postgres:16
+
+RELAY_DATABASE_URL=postgresql://relay:relay@localhost:5432/relay \
+  uv run uvicorn main:app --reload
+```
+
+Use the ordinary `postgresql://` URI.  SQLAlchemy reads a URL scheme as
+`dialect+driver` and maps a bare `postgresql://` to psycopg2, which this project
+does not install -- so `_normalize_database_url` rewrites it to
+`postgresql+psycopg://` (psycopg 3).  Deployments can keep handing over the
+standard URI that every other tool understands.
+
+### What changes between the backends
+
+SQLite has no `FOR UPDATE`, so `immediate_transaction` reserves the single
+writer slot with `BEGIN IMMEDIATE` and every mutating operation is serialized.
+PostgreSQL runs them concurrently and uses per-row locks instead, applied at
+each call site through `lock_rows`:
+
+| operation | PostgreSQL locking | why |
+| --- | --- | --- |
+| `claim_one` | `FOR UPDATE SKIP LOCKED` | a second worker must step over a row being claimed, not wait for it |
+| `recover_expired_in_session` | `FOR UPDATE SKIP LOCKED` | replicas' recovery passes must not fight over the same task |
+| `heartbeat` | blocking `FOR UPDATE` | this is about one specific task; waiting is correct |
+| `commit_terminal` | blocking `FOR UPDATE` | races recovery for one row; exactly one must win |
+| `create_task` | none | `uq_task_sender_idempotency` arbitrates; the loser is handed the winner's task |
+| `authenticate` | none | touches only its own agent row |
+
+Every operation that takes more than one lock takes them in the order
+task -> attempt, which is what keeps concurrent claims and recovery from
+deadlocking.
+
+`init_db` wraps `create_all` in a PostgreSQL advisory lock so several replicas
+booting together cannot race on DDL.  Pool sizing is configurable through
+`RELAY_DB_POOL_SIZE`, `RELAY_DB_MAX_OVERFLOW` and `RELAY_DB_POOL_TIMEOUT`.
+
 ## Verify
 
 The test suite covers the main protocol, sender/recipient access boundaries,
@@ -89,7 +132,14 @@ asset serving:
 
 ```bash
 uv run pytest -q
+
+# the same suite against PostgreSQL
+RELAY_DATABASE_URL=postgresql://relay:relay@localhost:5432/relay uv run pytest -q
 ```
+
+The suite must pass on both.  The concurrency test is the one that matters:
+disable `lock_rows` and run it on PostgreSQL and it fails with a duplicate
+`uq_attempt_task_number`, because two workers claimed the same task.
 
 Tests default to a scratch database at `/tmp/agent-relay-test.db` so they
 don't reset your dev server's `./agent-relay.db`. The fixture drops and
