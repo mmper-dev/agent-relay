@@ -1,0 +1,72 @@
+# Two services: the database and the relay API.
+#
+# There is no "version:" key -- it was required by the old docker-compose v1
+# and is obsolete in Compose v2, which warns if you include it.
+
+name: agent-relay
+
+services:
+  postgres:
+    image: postgres:16-alpine
+
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_DB: relay
+      # Read from a .env file or the shell, falling back to a dev value.
+      # A real deployment injects this from a secret store instead.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay}
+
+    # A NAMED VOLUME. Without it, the database lives in the container's
+    # writable layer and "docker compose down" destroys every agent, task and
+    # attempt. The volume outlives the container and is what makes the data
+    # real. Left side = Docker-managed volume, right side = path inside the
+    # container that PostgreSQL writes to.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    # "Started" is not "ready": PostgreSQL accepts no connections for the first
+    # second or two, and the initdb bootstrap on first run takes longer still.
+    # pg_isready is what turns a running container into a healthy one, and the
+    # relay below waits on exactly this.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+    # Published only so you can reach the database from Windows with psql or a
+    # GUI. The relay does not use this: it connects over the internal network.
+    # Drop this line and the database becomes unreachable from outside Docker.
+    ports:
+      - "5432:5432"
+
+    restart: unless-stopped
+
+  relay:
+    # Build from the Dockerfile in this directory, and tag the result so
+    # "docker image ls" and "kind load" can refer to it by name later.
+    build: .
+    image: agent-relay:dev
+
+    environment:
+      # "postgres" is the SERVICE NAME above, which Compose registers as a
+      # hostname on the network it creates. This is the one line that would be
+      # wrong as "localhost".
+      RELAY_DATABASE_URL: postgresql://relay:${POSTGRES_PASSWORD:-relay}@postgres:5432/relay
+
+    ports:
+      - "8000:8000"
+
+    # Wait for the healthcheck to pass, not merely for the container to exist.
+    # Plain "depends_on: [postgres]" only orders the starts and would race.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+# Declares the named volume used above. Docker creates it on first up and
+# keeps it until you explicitly run "docker compose down -v".
+volumes:
+  pgdata:

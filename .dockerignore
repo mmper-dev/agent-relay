@@ -1,0 +1,17 @@
+# Everything here is excluded from the build context. Keeps the image small,
+# builds fast, and secrets out of layers.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+.gitignore
+
+# Local SQLite database - the container must never ship with baked-in data.
+*.db
+*.db-shm
+*.db-wal
+
+# Agent tokens. Never in an image.
+*-credentials.json
