@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# A Job runs a pod to completion and then stops. This is Kubernetes' answer to
+# Compose's "condition: service_completed_successfully".
+#
+# Why it exists: main.py calls init_db() at import, which runs CREATE TABLE.
+# With two relay replicas booting at once, both would issue DDL simultaneously.
+# The app guards that with a PostgreSQL advisory lock, but doing schema setup
+# in a separate step that must succeed first is the honest pattern: one place
+# owns the schema, and a failure there is visible instead of hidden in a
+# crash-looping API pod.
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: relay-migrate
+spec:
+  backoffLimit: 6           # retry a failing pod up to 6 times, then give up
+  template:
+    spec:
+      restartPolicy: Never  # a Job pod must not be restarted in place
+      containers:
+        - name: migrate
+          image: agent-relay:dev
+          imagePullPolicy: IfNotPresent   # see the kind section: never "Always"
+          envFrom:
+            - secretRef:
+                name: relay-db
+          # Wait for the database, then create the schema, then exit 0.
+          # The Job is only "complete" when this exits successfully.
+          command:
+            - python
+            - -c
+            - |
+              import time, sys
+              from sqlalchemy import text
+              import database
+
+              for attempt in range(60):
+                  try:
+                      with database.engine.connect() as c:
+                          c.execute(text("SELECT 1"))
+                      break
+                  except Exception as exc:
+                      print(f"waiting for database ({attempt}): {exc}", flush=True)
+                      time.sleep(2)
+              else:
+                  sys.exit("database never became reachable")
+
+              database.init_db()
+              print("schema ready", flush=True)

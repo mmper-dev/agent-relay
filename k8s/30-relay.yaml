@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# The Service: one stable name, "relay", load balanced across every pod
+# labelled app=relay. Unlike the database's headless Service, this one DOES
+# balance - any replica can serve any request.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay
+spec:
+  selector:
+    app: relay
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+spec:
+  replicas: 2               # two API pods; the Service spreads traffic
+  selector:
+    matchLabels:
+      app: relay
+  template:
+    metadata:
+      labels:
+        app: relay
+    spec:
+      # /tasks/claim long-polls for up to 30 seconds. Give in-flight requests
+      # time to finish before the pod is killed. This belongs to the POD, not
+      # to a container - put it under the container and it is silently ignored.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: relay
+          image: agent-relay:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: relay-db
+          ports:
+            - containerPort: 8000
+
+          # LIVENESS: is the process wedged? Failing this RESTARTS the pod.
+          # Points at /health, which only proves the web server answers.
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # READINESS: should this pod receive traffic? Failing this REMOVES it
+          # from the Service but leaves it running. Points at /ready, which
+          # checks the database. A pod that loses its database stops being sent
+          # requests, and rejoins by itself when the database returns.
+          readinessProbe:
+            httpGet: { path: /ready, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }

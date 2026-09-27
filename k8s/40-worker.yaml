@@ -1,0 +1,170 @@
+# ---------------------------------------------------------------------------
+# THE IDENTITY PROBLEM, AGAIN.
+#
+# In Compose this was solved with a one-shot registration service writing to a
+# shared volume. That does not translate: a PersistentVolumeClaim with
+# ReadWriteOnce can only be mounted by pods on ONE node, and workers may be
+# scheduled anywhere. Shared-filesystem storage exists but is heavy machinery
+# for two short strings.
+#
+# Kubernetes has a better-fitting object: a Secret. The registration Job writes
+# the agent's credentials INTO a Secret through the Kubernetes API, and every
+# worker pod mounts that Secret as a file. One identity, any number of pods,
+# on any node.
+# ---------------------------------------------------------------------------
+
+# The Job needs permission to create a Secret. By default a pod can do nothing
+# to the cluster itself. These three objects grant exactly one capability.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker-register
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role                      # a Role is namespace-scoped permissions
+metadata:
+  name: worker-register
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]    # nothing else: no list, no delete, no update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding               # ties the Role to the ServiceAccount
+metadata:
+  name: worker-register
+subjects:
+  - kind: ServiceAccount
+    name: worker-register
+roleRef:
+  kind: Role
+  name: worker-register
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: worker-register
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: worker-register
+
+      # Three steps, because no single image has both our app and kubectl, and
+      # the whole thing must be safe to run twice.
+      #
+      #   1. fetch  - if the Secret already exists, write it to the shared dir
+      #   2. register - worker.py registers ONLY if that file is absent
+      #   3. publish  - create the Secret if it is not already there
+      #
+      # emptyDir is scratch space shared by every container in this one pod.
+      volumes:
+        - name: scratch
+          emptyDir: {}
+
+      initContainers:
+        # Step 1. Already registered on an earlier run? Recover the credentials
+        # so step 2 does not create a second agent.
+        - name: fetch-existing
+          image: alpine/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              if kubectl get secret relay-worker-identity >/dev/null 2>&1; then
+                kubectl get secret relay-worker-identity \
+                  -o jsonpath='{.data.uppercase\.json}' | base64 -d > /scratch/uppercase.json
+                echo "recovered existing identity"
+              else
+                echo "no existing identity; one will be registered"
+              fi
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+
+        # Step 2. Register the agent, but only if the file is missing.
+        # worker.py loads existing credentials when present, so this is a no-op
+        # on a re-run. "--stop-after 0" means: complete zero tasks, then exit.
+        - name: register
+          image: agent-relay:dev
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - main.py
+            - worker
+            - --base-url
+            - http://relay:8000
+            - --credentials
+            - /scratch/uppercase.json
+            - --name
+            - uppercase
+            - --stop-after
+            - "0"
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+
+      containers:
+        # Step 3. Publish the identity as a Secret every worker pod can mount.
+        - name: publish
+          image: alpine/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              if kubectl get secret relay-worker-identity >/dev/null 2>&1; then
+                echo "identity secret already present"
+              else
+                kubectl create secret generic relay-worker-identity \
+                  --from-file=uppercase.json=/scratch/uppercase.json
+                echo "identity secret created"
+              fi
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  replicas: 3                   # all three are the SAME agent, competing
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: worker
+          image: agent-relay:dev
+          imagePullPolicy: IfNotPresent
+          # No --name, so registering is impossible. The worker either loads
+          # the shared credentials or fails loudly. It cannot quietly invent a
+          # second identity, which is exactly the failure we are preventing.
+          command:
+            - python
+            - main.py
+            - worker
+            - --base-url
+            - http://relay:8000
+            - --credentials
+            - /creds/uppercase.json
+          volumeMounts:
+            - name: identity
+              mountPath: /creds
+              readOnly: true
+          # No probes: a worker serves no HTTP. Kubernetes restarts it if the
+          # process exits, which is all the supervision it needs.
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { memory: "256Mi" }
+      volumes:
+        - name: identity
+          secret:
+            secretName: relay-worker-identity   # each key becomes a file

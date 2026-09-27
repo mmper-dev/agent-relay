@@ -1,0 +1,94 @@
+# ---------------------------------------------------------------------------
+# A Service gives the database a stable name. Pods come and go with new names
+# and new IP addresses; "postgres" never changes.
+#
+# clusterIP: None makes this a "headless" Service: no load balancer, the name
+# resolves straight to the pod. That is what you want for a database, where
+# there is exactly one instance and you must reach that one.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  clusterIP: None
+  selector:
+    app: postgres          # any pod labelled app=postgres is behind this name
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# ---------------------------------------------------------------------------
+# A StatefulSet, not a Deployment.
+#
+# A Deployment treats its pods as interchangeable: it may start the new one
+# before stopping the old, and all replicas share one storage definition. For a
+# database that is dangerous - two PostgreSQL processes writing one data
+# directory corrupt it.
+#
+# A StatefulSet gives each pod a stable identity (postgres-0), its own storage,
+# and guarantees the old pod is fully gone before the replacement starts.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres      # must match the selector above, or nothing starts
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef:
+                name: relay-db     # every key in the Secret becomes an env var
+          env:
+            # The official image needs its data in a SUBDIRECTORY of the mount
+            # when using a PersistentVolumeClaim, because the mount point
+            # itself contains a lost+found directory that initdb refuses.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+
+          # Same pg_isready check as Compose, in Kubernetes clothing.
+          # readiness: should traffic be sent here yet?
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "relay", "-d", "relay"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          # liveness: is it wedged and in need of a restart?
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "relay", "-d", "relay"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "512Mi" }
+
+  # The StatefulSet's own storage template. Each pod gets a PersistentVolumeClaim
+  # created from this - a request for disk that the cluster fulfils. Deleting
+  # the StatefulSet does NOT delete the claim, which is the point: the data
+  # survives.
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
