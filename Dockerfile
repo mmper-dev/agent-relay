@@ -37,6 +37,12 @@ RUN useradd --create-home --uid 10001 relay
 # container - which is the correct default for a container.
 RUN install -d -o relay -g relay /data
 
+# Mount point for the shared worker credentials. It must exist in the image
+# and be owned by relay: when Docker mounts an empty named volume over a
+# path, it seeds the volume with that path's ownership. Skip this and the
+# volume arrives root-owned and the worker cannot write its token file.
+RUN install -d -o relay -g relay /creds
+
 WORKDIR /app
 
 COPY --from=builder --chown=relay:relay /app/.venv /app/.venv

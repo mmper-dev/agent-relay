@@ -66,7 +66,70 @@ services:
 
     restart: unless-stopped
 
+  # One-shot registration. Creates the "uppercase" agent identity exactly once
+  # and writes agent_id + token to the shared /creds volume, then exits 0.
+  # "--stop-after 0" means complete zero tasks, i.e. register and stop.
+  #
+  # It is idempotent: on later runs the credentials file already exists, so
+  # worker.py loads it instead of registering again.
+  worker-register:
+    image: agent-relay:dev
+    command:
+      - python
+      - main.py
+      - worker
+      - --base-url
+      - http://relay:8000
+      - --credentials
+      - /creds/uppercase.json
+      - --name
+      - uppercase
+      - --stop-after
+      - "0"
+    volumes:
+      - workercreds:/creds
+    depends_on:
+      relay:
+        condition: service_healthy
+    # The image's HEALTHCHECK probes the HTTP API, which a worker does not
+    # serve. One image, two roles: turn the inherited check off here rather
+    # than let every worker sit permanently "unhealthy" and train you to
+    # ignore the column.
+    healthcheck:
+      disable: true
+    # Never restart: this is a job, not a service. Restarting it would be a
+    # crash loop by definition, because success means exiting.
+    restart: "no"
+
+  # The workers. No --name, so registration is impossible: they either load the
+  # shared credentials or fail loudly. Every replica is therefore the SAME
+  # agent, and they compete for one inbox -- which is what FOR UPDATE SKIP
+  # LOCKED in the storage layer exists to make safe.
+  worker:
+    image: agent-relay:dev
+    command:
+      - python
+      - main.py
+      - worker
+      - --base-url
+      - http://relay:8000
+      - --credentials
+      - /creds/uppercase.json
+    volumes:
+      - workercreds:/creds
+    # The image's HEALTHCHECK probes the HTTP API, which a worker does not
+    # serve. One image, two roles: turn the inherited check off here rather
+    # than let every worker sit permanently "unhealthy" and train you to
+    # ignore the column.
+    healthcheck:
+      disable: true
+    depends_on:
+      worker-register:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 # Declares the named volume used above. Docker creates it on first up and
 # keeps it until you explicitly run "docker compose down -v".
 volumes:
   pgdata:
+  workercreds:
