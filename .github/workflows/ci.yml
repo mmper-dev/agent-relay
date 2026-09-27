@@ -1,0 +1,129 @@
+# Test, then build, then deploy - in that order, and the order is the point.
+#
+# The "deploy" job declares "needs: test". If any test fails, the test job
+# fails, the deploy job never starts, and whatever is already running in the
+# cluster keeps running untouched. Nothing is rolled back because nothing was
+# rolled forward.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+env:
+  IMAGE_REPO: agent-relay
+  KIND_CLUSTER: relay
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1 - the gate. Runs the suite twice: once on SQLite, once on PostgreSQL.
+  # Both must pass. The concurrency tests only prove anything on PostgreSQL.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    # A throwaway PostgreSQL for this job only. GitHub starts it, waits for the
+    # health check, and throws it away afterwards.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      # act bind-mounts the real repo folder, so without this uv would build
+      # its virtualenv straight into your working copy's .venv and mix Linux
+      # files into a Windows one. Keep the CI environment out of the workspace.
+      - name: Install dependencies
+        env:
+          UV_PROJECT_ENVIRONMENT: /tmp/ci-venv
+        run: uv sync --frozen
+
+      - name: Protocol tests on SQLite
+        env:
+          UV_PROJECT_ENVIRONMENT: /tmp/ci-venv
+          RELAY_DATABASE_URL: sqlite:////tmp/agent-relay-ci.db
+        run: uv run pytest -q
+
+      - name: The same tests against PostgreSQL
+        env:
+          # Plain postgresql:// on purpose - the app rewrites it to
+          # postgresql+psycopg:// itself. This checks that normalization too.
+          UV_PROJECT_ENVIRONMENT: /tmp/ci-venv
+          RELAY_DATABASE_URL: postgresql://relay:relay@localhost:5432/relay
+        run: uv run pytest -q
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 - only runs if JOB 1 succeeded.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Build and deploy to kind
+    needs: test               # <<< THE GATE. Remove this line and a broken
+                              #     build ships. It is the most important line
+                              #     in the file.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A unique tag per run. Using a fixed tag like ":dev" would mean
+      # Kubernetes sees no change and never replaces the pods - the deploy
+      # would appear to succeed while changing nothing.
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Install kubectl and kind
+        run: |
+          set -eux
+          KUBECTL_VERSION="$(curl -sSL https://dl.k8s.io/release/stable.txt)"
+          curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -sSLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x /usr/local/bin/kubectl /usr/local/bin/kind
+
+      # --provenance=false: without it, buildx attaches an attestation manifest
+      # and "kind load" fails with an unhelpful missing-content-digest error.
+      - name: Build the image
+        run: |
+          docker build --provenance=false --sbom=false \
+            -t "${IMAGE_REPO}:${{ steps.tag.outputs.tag }}" .
+
+      # A kind cluster cannot see images in the local Docker. Push it in.
+      - name: Load the image into the cluster
+        run: kind load docker-image "${IMAGE_REPO}:${{ steps.tag.outputs.tag }}" --name "${KIND_CLUSTER}"
+
+      - name: Point kubectl at the cluster
+        run: |
+          mkdir -p ~/.kube
+          kind get kubeconfig --name "${KIND_CLUSTER}" > ~/.kube/config
+          kubectl get nodes
+
+      - name: Roll out the new image
+        run: |
+          kubectl set image deployment/relay  relay="${IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+          kubectl set image deployment/worker worker="${IMAGE_REPO}:${{ steps.tag.outputs.tag }}"
+
+      # Without this the job would finish while pods were still starting, and a
+      # deploy that crash-loops would be reported as a success.
+      - name: Wait for the rollout to finish
+        run: |
+          kubectl rollout status deployment/relay  --timeout=180s
+          kubectl rollout status deployment/worker --timeout=180s
+          kubectl get pods

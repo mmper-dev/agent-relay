@@ -1,0 +1,9 @@
+# Settings act picks up automatically when run from this directory.
+#
+# act runs each job inside a container. The default image is tiny and lacks the
+# docker CLI, curl and the other things the workflow needs, so point
+# ubuntu-latest at an image that mirrors a real GitHub runner.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Don't re-pull images that are already local on every run.
+--pull=false

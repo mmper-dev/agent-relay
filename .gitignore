@@ -6,3 +6,6 @@
 __pycache__/
 .pytest_cache/
 *-credentials.json
+
+# act writes its event/secret scratch here
+.act-*

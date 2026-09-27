@@ -20,3 +20,10 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.uv]
+# The starter shipped with dependency resolution pinned to a date, so builds
+# are reproducible. That pin only lived in uv.lock's [options], which is
+# generated - so every `uv` run judged the lockfile stale and dropped it.
+# Declaring it here is what actually makes it stick.
+exclude-newer = "2026-09-02T14:43:46.988566751Z"

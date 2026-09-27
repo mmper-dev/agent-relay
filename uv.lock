@@ -4,7 +4,6 @@ requires-python = ">=3.11"
 
 [options]
 exclude-newer = "2026-09-02T14:43:46.988566751Z"
-exclude-newer-span = "P7D"
 
 [[package]]
 name = "agent-relay"
