@@ -123,6 +123,81 @@ deadlocking.
 booting together cannot race on DDL.  Pool sizing is configurable through
 `RELAY_DB_POOL_SIZE`, `RELAY_DB_MAX_OVERFLOW` and `RELAY_DB_POOL_TIMEOUT`.
 
+## Containers
+
+`Dockerfile` builds a multi-stage image: `uv` installs dependencies in a builder
+stage, and only the resulting virtualenv is copied into the runtime image. It
+runs as uid 10001, with `/app` root-owned so the process cannot rewrite its own
+code; writable state goes to `/data`, and shared worker credentials to `/creds`.
+
+Build it without build attestations, or `kind load` later fails with an opaque
+missing-content-digest error:
+
+```bash
+docker build --provenance=false --sbom=false -t agent-relay:dev .
+```
+
+`compose.yaml` runs the relay, PostgreSQL and the workers as separate services:
+
+```bash
+docker compose up -d --scale worker=3
+docker compose ps
+docker compose down       # keeps the data volume; `down -v` destroys it
+```
+
+Three things in there are worth reading:
+
+- the relay waits on a `pg_isready` healthcheck (`condition: service_healthy`),
+  not a sleep;
+- PostgreSQL keeps its data in a named volume, so it survives `down`;
+- `worker-register` is a one-shot service that registers the `uppercase` agent
+  once and writes its credentials to a shared volume. Every worker replica then
+  mounts the same identity. Without it, each replica registers a *different*
+  agent, nothing errors, and scaling silently does nothing.
+
+## Kubernetes (kind)
+
+`k8s/` holds the same system as Kubernetes objects: PostgreSQL as a StatefulSet
+with a headless Service and a PersistentVolumeClaim, schema creation as a Job,
+the relay as a Deployment of two behind a Service, and the workers as a
+Deployment of three. `/health` drives the liveness probe and `/ready` the
+readiness probe, so losing the database drains traffic instead of restarting
+pods.
+
+The worker identity is a Secret here rather than a shared volume, because a
+`ReadWriteOnce` claim is single-node and workers can be scheduled anywhere. A
+registration Job publishes it, using a ServiceAccount scoped to `get` and
+`create` on secrets and nothing else.
+
+```bash
+kind create cluster --name relay
+kind load docker-image agent-relay:dev --name relay   # the cluster cannot see local images
+kubectl apply -f k8s/
+kubectl port-forward svc/relay 8000:8000
+```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs two jobs. `test` runs the suite twice: once on
+SQLite, once against a PostgreSQL service container. `deploy` declares
+`needs: test`, so a failing test means it never starts and whatever is already
+deployed keeps running untouched.
+
+The deploy job tags each image with a timestamp and commit sha — a fixed tag
+would leave Kubernetes seeing no change and deploying nothing — loads it into
+kind, updates both Deployments, and blocks on `kubectl rollout status` so a
+crash-looping deploy is reported as a failure rather than a success.
+
+Run it locally with [act](https://nektosact.com/); `.actrc` supplies a runner
+image that has `docker` and `curl`:
+
+```bash
+act push
+```
+
+Note this workflow deploys to a local kind cluster, so it is meant for `act`. A
+hosted run would push the image to a registry and deploy to a real cluster.
+
 ## Verify
 
 The test suite covers the main protocol, sender/recipient access boundaries,

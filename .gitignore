@@ -9,3 +9,6 @@ __pycache__/
 
 # act writes its event/secret scratch here
 .act-*
+
+# editor settings
+.vscode/
